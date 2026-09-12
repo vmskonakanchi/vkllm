@@ -1,0 +1,37 @@
+"""Continuous-batching scheduler: interleaved requests must match single-request output."""
+
+import pytest
+import torch
+
+from vkllm.scheduler import Request, Scheduler
+
+SPECS = [
+    ("The capital of France is", 30),
+    ("Once upon a time", 10),
+    ("The meaning of life is", 20),
+]
+
+
+@pytest.fixture(scope="module")
+def alone_outputs(model, tokenizer):
+    """Ground truth: each request run alone via the verified generate()."""
+    out = {}
+    for i, (prompt, n) in enumerate(SPECS):
+        ids = torch.tensor(tokenizer(prompt)["input_ids"])
+        out[i] = model.generate(ids, max_new_tokens=n).tolist()
+    return out
+
+
+def test_scheduler_matches_single_request(model, tokenizer, alone_outputs):
+    sched = Scheduler(model, max_active=8)
+    reqs = []
+    for i, (prompt, n) in enumerate(SPECS):
+        ids = torch.tensor(tokenizer(prompt)["input_ids"])
+        r = Request(f"req{i}", ids, max_new_tokens=n, model=model)
+        reqs.append(r)
+        sched.add_request(r)
+
+    sched.run_until_done()
+
+    for i, r in enumerate(reqs):
+        assert r.all_ids.tolist() == alone_outputs[i], f"req{i} diverged"
