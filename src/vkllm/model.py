@@ -424,3 +424,76 @@ class Model:
         out = out @ Wo.T
         return out.unsqueeze(1)                           # (B, 1, 576)
 
+
+    # ==================================================================
+    # Phase 5: PAGED path (dedicated; proves PagedAttention == contiguous).
+    #
+    # Same math as attention()/forward(), but K/V live in a PagedKVCache
+    # (scattered fixed-size blocks) instead of a contiguous torch.cat tensor.
+    # ==================================================================
+    def _attn_paged(self, x, layer, paged, block_table, positions, position_offset):
+        cfg = self.config
+        seq_len = x.shape[0]
+        p = f"model.layers.{layer}.self_attn"
+        Wq = self.w(f"{p}.q_proj.weight")
+        Wk = self.w(f"{p}.k_proj.weight")
+        Wv = self.w(f"{p}.v_proj.weight")
+        Wo = self.w(f"{p}.o_proj.weight")
+
+        q = (x @ Wq.T).view(seq_len, cfg.num_q_heads, cfg.head_dim).transpose(0, 1)   # (9,seq,64)
+        k = (x @ Wk.T).view(seq_len, cfg.num_kv_heads, cfg.head_dim).transpose(0, 1)  # (3,seq,64)
+        v = (x @ Wv.T).view(seq_len, cfg.num_kv_heads, cfg.head_dim).transpose(0, 1)
+
+        cos, sin = self.rope_tables(seq_len, position_offset)
+        q = self.apply_rope(q, cos, sin)
+        k = self.apply_rope(k, cos, sin)
+
+        # write the new tokens' k/v into the request's blocks, then gather ALL.
+        paged.append(layer, block_table, positions, k, v)
+        k_all, v_all = paged.gather(layer, block_table)   # (3, total_len, 64)
+        total_len = k_all.shape[1]
+
+        rep = cfg.num_q_heads // cfg.num_kv_heads
+        k_all = k_all.repeat_interleave(rep, dim=0)       # (9, total_len, 64)
+        v_all = v_all.repeat_interleave(rep, dim=0)
+
+        scores = q @ k_all.transpose(-2, -1) / math.sqrt(cfg.head_dim)  # (9, seq, total_len)
+        if seq_len > 1:
+            q_pos = torch.arange(seq_len, device=self.device).unsqueeze(1) + position_offset
+            k_pos = torch.arange(total_len, device=self.device).unsqueeze(0)
+            scores = scores.masked_fill(k_pos > q_pos, float("-inf"))
+        weights = torch.softmax(scores, dim=-1)
+        out = weights @ v_all                             # (9, seq, 64)
+        out = out.transpose(0, 1).reshape(seq_len, cfg.hidden_size)
+        return out @ Wo.T
+
+    def _forward_paged(self, token_ids, paged, block_table, positions, position_offset):
+        h = self.embed(token_ids)
+        for layer in range(self.config.num_layers):
+            w_in = self.w(f"model.layers.{layer}.input_layernorm.weight")
+            w_post = self.w(f"model.layers.{layer}.post_attention_layernorm.weight")
+            h = h + self._attn_paged(self.rmsnorm(h, w_in), layer, paged,
+                                     block_table, positions, position_offset)
+            h = h + self.mlp(self.rmsnorm(h, w_post), layer)
+        h = self.rmsnorm(h, self.w("model.norm.weight"))
+        return h @ self.w("model.embed_tokens.weight").T
+
+    @torch.no_grad()
+    def generate_paged(self, token_ids, max_new_tokens, paged, block_table):
+        """Greedy generation backed by the PAGED KV cache."""
+        ids = token_ids.to(self.device)
+
+        # PREFILL: reserve a block-table slot for every prompt token.
+        positions = [block_table.append_token() for _ in range(ids.shape[0])]
+        logits = self._forward_paged(ids, paged, block_table, positions, position_offset=0)
+        next_id = logits[-1].argmax()
+        ids = torch.cat([ids, next_id.view(1)])
+
+        # DECODE: one new token per step -> reserve one slot, feed one token.
+        for _ in range(max_new_tokens - 1):
+            offset = ids.shape[0] - 1
+            positions = [block_table.append_token()]
+            logits = self._forward_paged(next_id.view(1), paged, block_table, positions, offset)
+            next_id = logits[-1].argmax()
+            ids = torch.cat([ids, next_id.view(1)])
+        return ids

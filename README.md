@@ -52,6 +52,10 @@ optimization is grounded in the problem it solves.
   free their slot while long ones keep running.
 - **True tensor-batched decode** — many requests advance in a single batched
   forward pass (left-padded caches + padding mask).
+- **Paged KV cache (PagedAttention)** — the cache is split into fixed-size
+  blocks from a shared pool, mapped per request by a block table (OS-style
+  virtual memory). Removes padding/reallocation waste; freed blocks are reused.
+  Verified token-for-token identical to the contiguous path.
 - **HTTP server** — FastAPI front door; concurrent requests are batched by a
   background engine loop.
 - **Logging** — centralized, level-controlled observability of the request
@@ -63,7 +67,7 @@ optimization is grounded in the problem it solves.
 - [x] Phase 2 — Single-request inference
 - [x] Phase 3 — KV cache
 - [x] Phase 4 — Continuous batching + HTTP server
-- [ ] Phase 5 — Paged KV cache (PagedAttention)
+- [x] Phase 5 — Paged KV cache (PagedAttention)
 - [ ] Phase 6 — GPU execution (MPS — basic support already wired)
 - [ ] Phase 7 — Tensor parallelism
 - [ ] Phase 8 — Distributed inference
@@ -108,7 +112,8 @@ uv run pytest
 ```
 src/vkllm/
   config.py      # model config (loaded from HF config.json)
-  model.py       # hand-written forward pass + KV cache + batched decode
+  model.py       # hand-written forward pass + KV cache + batched/paged decode
+  paged_cache.py # block pool + block tables + paged KV storage (PagedAttention)
   scheduler.py   # continuous-batching scheduler + Request state
   server.py      # FastAPI serving layer
   logger.py      # centralized logging
