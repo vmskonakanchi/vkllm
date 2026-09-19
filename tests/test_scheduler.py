@@ -35,3 +35,25 @@ def test_scheduler_matches_single_request(model, tokenizer, alone_outputs):
 
     for i, r in enumerate(reqs):
         assert r.all_ids.tolist() == alone_outputs[i], f"req{i} diverged"
+
+
+def test_cache_aware_admission_defers_under_pressure(model, tokenizer, alone_outputs):
+    """With a TIGHT block budget, requests must be DEFERRED (wait their turn)
+    rather than crash -- and every request must still produce correct output."""
+    # Tiny budget: block_size 16, only 4 blocks = 64 tokens total capacity.
+    # The 3 requests (with generation) can't all fit at once, so some wait.
+    sched = Scheduler(model, max_active=8, block_size=16, total_blocks=4)
+    reqs = []
+    for i, (prompt, n) in enumerate(SPECS):
+        ids = torch.tensor(tokenizer(prompt)["input_ids"])
+        r = Request(f"req{i}", ids, max_new_tokens=n, model=model)
+        reqs.append(r)
+        sched.add_request(r)
+
+    sched.run_until_done()   # must complete, not deadlock/crash
+
+    # all requests still correct despite being scheduled under memory pressure
+    for i, r in enumerate(reqs):
+        assert r.all_ids.tolist() == alone_outputs[i], f"req{i} diverged"
+    # budget fully returned after everything finishes
+    assert sched.free_blocks == sched.total_blocks

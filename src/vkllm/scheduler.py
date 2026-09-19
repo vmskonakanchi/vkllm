@@ -36,6 +36,7 @@ class Request:
         self.all_ids = prompt_ids             # prompt + generated, grows each step
         self.prefilled = False                # have we run the prompt through yet?
         self.next_token: torch.Tensor | None = None  # the most recent token to feed next
+        self.blocks_held = 0                  # KV-cache blocks reserved for this request
 
     # --- small state helpers: YOU implement these (pure logic, no math) ---
 
@@ -71,12 +72,23 @@ class Scheduler:
     forward pass over all requests at once -- is the later optimization.)
     """
 
-    def __init__(self, model, max_active: int = 8):
+    def __init__(self, model, max_active: int = 8,
+                 block_size: int = 16, total_blocks: int = 128):
         self.model = model
         self.max_active = max_active          # cap on requests processed concurrently
+        # KV-cache MEMORY budget, tracked as a block counter. This models the
+        # REAL constraint (memory), separate from the request-count cap.
+        self.block_size = block_size
+        self.total_blocks = total_blocks
+        self.free_blocks = total_blocks       # blocks currently available
         self.waiting: list[Request] = []      # arrived but not yet admitted
         self.active: list[Request] = []       # currently being decoded
         self.finished: list[Request] = []     # done, results ready to return
+
+    def blocks_needed(self, num_tokens: int) -> int:
+        """How many fixed-size blocks hold num_tokens (rounded UP)."""
+        # ceil(num_tokens / block_size). -(-a // b) is ceiling division, no import.
+        return -(-num_tokens // self.block_size)
 
     def add_request(self, req: Request) -> None:
         # A new request arrives -> put it in the waiting queue.
@@ -85,14 +97,31 @@ class Scheduler:
                  req.id, len(req.prompt_ids), req.max_new_tokens, len(self.waiting))
 
     def _admit(self) -> None:
-        """Move waiting requests into active while there's room."""
-        # while there are free slots AND waiting requests, admit the OLDEST
-        # (pop(0) = FIFO, fair first-come-first-served).
-        while len(self.active) < self.max_active and self.waiting:
-            req = self.waiting.pop(0)
+        """Admit waiting requests -- only if there's room in BOTH the active-slot
+        cap AND the KV-cache block budget.
+
+        A request needs enough blocks for its prompt to be admitted. If the
+        OLDEST waiting request doesn't fit right now, we DEFER it (leave it in
+        the queue) rather than crash. This is the core of cache-aware scheduling.
+        """
+        while self.waiting and len(self.active) < self.max_active:
+            req = self.waiting[0]                       # peek at the oldest (FIFO)
+            need = self.blocks_needed(len(req.prompt_ids))
+
+            if need > self.free_blocks:
+                # Not enough KV memory right now -> defer. Stop here (FIFO: don't
+                # skip ahead to a smaller request behind this one).
+                log.info("request %s deferred: needs %d blocks, only %d free",
+                         req.id, need, self.free_blocks)
+                break
+
+            # Fits -> admit and RESERVE its prompt blocks from the budget.
+            self.waiting.pop(0)
             self.active.append(req)
-            log.info("request %s admitted | active=%d waiting=%d",
-                     req.id, len(self.active), len(self.waiting))
+            self.free_blocks -= need
+            req.blocks_held = need                      # track blocks this req owns
+            log.info("request %s admitted | reserved %d blocks | free=%d active=%d",
+                     req.id, need, self.free_blocks, len(self.active))
 
     def _step_request(self, req: Request) -> None:
         """Advance ONE request by ONE token (prefill if needed, else decode)."""
@@ -128,6 +157,7 @@ class Scheduler:
                 logits = self.model.forward(req.prompt_ids, cache=req.cache, position_offset=0)
                 req.prefilled = True
                 req.record_token(int(logits[-1].argmax()))
+                self._reserve_if_grown(req)      # the new token may need a block
                 just_prefilled.append(req)
         if just_prefilled:
             log.debug("prefilled %d request(s): %s",
@@ -143,19 +173,33 @@ class Scheduler:
             next_ids = self.model.decode_batch(token_ids, caches, offsets)   # (B,)
             for r, tid in zip(decoding, next_ids):
                 r.record_token(int(tid))
+                self._reserve_if_grown(r)        # each new token may need a block
             log.debug("decoded batch of %d | max_offset=%d",
                       len(decoding), max(offsets))
 
         # 3. retire finished (rebuild list; don't mutate while iterating).
+        #    A finished request RETURNS all its blocks to the budget for reuse.
         still_active = []
         for req in self.active:
             if req.is_done():
+                self.free_blocks += req.blocks_held
+                req.blocks_held = 0
                 self.finished.append(req)
-                log.info("request %s finished (%d tokens) | active=%d",
-                         req.id, len(req.generated), len(still_active))
+                log.info("request %s finished (%d tokens) | freed blocks | free=%d active=%d",
+                         req.id, len(req.generated), self.free_blocks, len(still_active))
             else:
                 still_active.append(req)
         self.active = still_active
+
+    def _reserve_if_grown(self, req: Request) -> None:
+        """After a request adds a token, reserve one more block if it just
+        crossed into a new block. Models decode-time cache growth."""
+        total_len = len(req.all_ids)
+        need = self.blocks_needed(total_len)
+        if need > req.blocks_held:
+            extra = need - req.blocks_held
+            self.free_blocks -= extra            # may go negative under pressure
+            req.blocks_held = need
 
     def has_work(self) -> bool:
         # anything still to do -> active requests OR waiting requests.
