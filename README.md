@@ -71,7 +71,7 @@ optimization is grounded in the problem it solves.
 - [ ] Phase 6 — GPU execution (MPS — basic support already wired)
 - [ ] Phase 7 — Tensor parallelism
 - [ ] Phase 8 — Distributed inference
-- [~] Phase 9 — KV-cache-aware scheduling (memory-based admission done; preemption next)
+- [x] Phase 9 — KV-cache-aware scheduling (memory-based admission + recomputation preemption)
 - [ ] Phase 10 — Failure handling + observability
 
 ## Setup

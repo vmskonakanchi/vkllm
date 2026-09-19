@@ -37,6 +37,16 @@ class Request:
         self.prefilled = False                # have we run the prompt through yet?
         self.next_token: torch.Tensor | None = None  # the most recent token to feed next
         self.blocks_held = 0                  # KV-cache blocks reserved for this request
+        self.preempted = False                # was this request evicted & is resuming?
+
+    def reset_for_resume(self, model) -> None:
+        """Preemption: drop the KV cache (free its memory) but KEEP the tokens
+        generated so far. On resume the request re-prefills all_ids to rebuild
+        the cache -- trading compute (redo prefill) for memory (freed blocks)."""
+        self.cache = model.new_cache()        # fresh empty cache; old K/V discarded
+        self.prefilled = False                # must re-prefill before decoding
+        self.blocks_held = 0                  # blocks were returned to the pool
+        self.preempted = True                 # remember so prefill re-runs all_ids
 
     # --- small state helpers: YOU implement these (pure logic, no math) ---
 
@@ -106,7 +116,9 @@ class Scheduler:
         """
         while self.waiting and len(self.active) < self.max_active:
             req = self.waiting[0]                       # peek at the oldest (FIFO)
-            need = self.blocks_needed(len(req.prompt_ids))
+            # a resumed (preempted) request re-prefills ALL its tokens so far;
+            # a fresh request just needs its prompt.
+            need = self.blocks_needed(len(req.all_ids))
 
             if need > self.free_blocks:
                 # Not enough KV memory right now -> defer. Stop here (FIFO: don't
@@ -115,13 +127,14 @@ class Scheduler:
                          req.id, need, self.free_blocks)
                 break
 
-            # Fits -> admit and RESERVE its prompt blocks from the budget.
+            # Fits -> admit and RESERVE its blocks from the budget.
             self.waiting.pop(0)
             self.active.append(req)
             self.free_blocks -= need
             req.blocks_held = need                      # track blocks this req owns
-            log.info("request %s admitted | reserved %d blocks | free=%d active=%d",
-                     req.id, need, self.free_blocks, len(self.active))
+            log.info("request %s admitted%s | reserved %d blocks | free=%d active=%d",
+                     req.id, " (resumed)" if req.preempted else "",
+                     need, self.free_blocks, len(self.active))
 
     def _step_request(self, req: Request) -> None:
         """Advance ONE request by ONE token (prefill if needed, else decode)."""
@@ -154,11 +167,23 @@ class Scheduler:
         just_prefilled = []
         for req in self.active:
             if not req.prefilled:
-                logits = self.model.forward(req.prompt_ids, cache=req.cache, position_offset=0)
-                req.prefilled = True
-                req.record_token(int(logits[-1].argmax()))
-                self._reserve_if_grown(req)      # the new token may need a block
-                just_prefilled.append(req)
+                if req.preempted:
+                    # RESUME: rebuild the K/V cache for all tokens EXCEPT the
+                    # last one, so state matches a request that was never evicted:
+                    # cache holds all-but-last, and next_token (the last token)
+                    # is decoded normally on the following step. We don't record
+                    # a new token here -- we already generated these.
+                    self.model.forward(req.all_ids[:-1], cache=req.cache, position_offset=0)
+                    req.prefilled = True
+                    req.preempted = False
+                    req.next_token = req.all_ids[-1:].clone()  # last token, fed next
+                else:
+                    # FRESH prefill: run the prompt, produce the first token.
+                    logits = self.model.forward(req.prompt_ids, cache=req.cache, position_offset=0)
+                    req.prefilled = True
+                    req.record_token(int(logits[-1].argmax()))
+                    just_prefilled.append(req)
+                self._reserve_if_grown(req)
         if just_prefilled:
             log.debug("prefilled %d request(s): %s",
                       len(just_prefilled), [r.id for r in just_prefilled])
@@ -193,13 +218,42 @@ class Scheduler:
 
     def _reserve_if_grown(self, req: Request) -> None:
         """After a request adds a token, reserve one more block if it just
-        crossed into a new block. Models decode-time cache growth."""
-        total_len = len(req.all_ids)
-        need = self.blocks_needed(total_len)
-        if need > req.blocks_held:
-            extra = need - req.blocks_held
-            self.free_blocks -= extra            # may go negative under pressure
-            req.blocks_held = need
+        crossed into a new block. If the budget can't cover it, PREEMPT another
+        request to free memory (Layer 2 -- graceful degradation, no crash)."""
+        need = self.blocks_needed(len(req.all_ids))
+        extra = need - req.blocks_held
+        if extra <= 0:
+            return                                # still fits in current blocks
+
+        # Free up room by preempting OTHER requests until this token fits.
+        while self.free_blocks < extra:
+            victim = self._pick_victim(exclude=req)
+            if victim is None:
+                break                             # nothing left to preempt; proceed anyway
+            self._preempt(victim)
+
+        self.free_blocks -= extra
+        req.blocks_held = need
+
+    def _pick_victim(self, exclude: Request) -> Request | None:
+        """Choose a request to preempt. Policy: the NEWEST active request
+        (last admitted) other than `exclude` -- it has waited least and is
+        cheapest to redo. Returns None if there's no other request."""
+        for r in reversed(self.active):           # newest first
+            if r is not exclude and r.blocks_held > 0:
+                return r
+        return None
+
+    def _preempt(self, victim: Request) -> None:
+        """Evict a request: return its blocks to the budget, drop its cache,
+        keep its tokens, and requeue it at the FRONT to resume soon."""
+        freed = victim.blocks_held
+        self.free_blocks += freed
+        victim.reset_for_resume(self.model)       # drop K/V, keep tokens
+        self.active.remove(victim)
+        self.waiting.insert(0, victim)            # front of queue -> resumes soon
+        log.info("request %s PREEMPTED | freed %d blocks | free=%d",
+                 victim.id, freed, self.free_blocks)
 
     def has_work(self) -> bool:
         # anything still to do -> active requests OR waiting requests.
