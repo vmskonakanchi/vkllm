@@ -69,8 +69,8 @@ optimization is grounded in the problem it solves.
 - [x] Phase 4 — Continuous batching + HTTP server
 - [x] Phase 5 — Paged KV cache (PagedAttention)
 - [x] Phase 6 — KV-cache-aware scheduling (memory-based admission + recomputation preemption)
-- [ ] Phase 7 — Tensor parallelism *(next)*
-- [ ] Phase 8 — Distributed inference
+- [x] Phase 7 — Tensor parallelism (sharded MLP + attention, all-reduce; simulated shards)
+- [ ] Phase 8 — Distributed inference *(next)*
 - [ ] Phase 9 — Failure handling + observability
 - [ ] Phase 10 — GPU-accelerated execution (batched prefill on MPS/CUDA)
 
@@ -112,9 +112,10 @@ uv run pytest
 ```
 src/vkllm/
   config.py      # model config (loaded from HF config.json)
-  model.py       # hand-written forward pass + KV cache + batched/paged decode
-  paged_cache.py # block pool + block tables + paged KV storage (PagedAttention)
-  scheduler.py   # continuous-batching scheduler + Request state
+  model.py         # hand-written forward pass + KV cache + batched/paged decode
+  paged_cache.py   # block pool + block tables + paged KV storage (PagedAttention)
+  scheduler.py     # continuous-batching + cache-aware scheduler + Request state
+  tensor_parallel.py # sharded MLP/attention + all-reduce (tensor parallelism)
   server.py      # FastAPI serving layer
   logger.py      # centralized logging
 tests/           # pytest suite (component + end-to-end correctness)
