@@ -68,11 +68,11 @@ optimization is grounded in the problem it solves.
 - [x] Phase 3 — KV cache
 - [x] Phase 4 — Continuous batching + HTTP server
 - [x] Phase 5 — Paged KV cache (PagedAttention)
-- [ ] Phase 6 — GPU execution (MPS — basic support already wired)
-- [ ] Phase 7 — Tensor parallelism
+- [x] Phase 6 — KV-cache-aware scheduling (memory-based admission + recomputation preemption)
+- [ ] Phase 7 — Tensor parallelism *(next)*
 - [ ] Phase 8 — Distributed inference
-- [x] Phase 9 — KV-cache-aware scheduling (memory-based admission + recomputation preemption)
-- [ ] Phase 10 — Failure handling + observability
+- [ ] Phase 9 — Failure handling + observability
+- [ ] Phase 10 — GPU-accelerated execution (batched prefill on MPS/CUDA)
 
 ## Setup
 
