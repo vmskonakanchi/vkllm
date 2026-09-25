@@ -60,6 +60,12 @@ optimization is grounded in the problem it solves.
   background engine loop.
 - **Logging** — centralized, level-controlled observability of the request
   lifecycle.
+- **Production worker features** — the server is a manageable cluster worker:
+  `/health` (liveness), `/ready` (readiness, 503 when overloaded/draining),
+  `/stats` (capacity: active/waiting/KV-utilization for load-based routing),
+  `/metrics` (Prometheus: throughput, p50/p99 latency, counts). Failing
+  requests are isolated (retired as errors without crashing the engine), and
+  shutdown drains in-flight work.
 
 ## Roadmap
 
@@ -70,8 +76,8 @@ optimization is grounded in the problem it solves.
 - [x] Phase 5 — Paged KV cache (PagedAttention)
 - [x] Phase 6 — KV-cache-aware scheduling (memory-based admission + recomputation preemption)
 - [x] Phase 7 — Tensor parallelism (sharded MLP + attention, all-reduce; simulated shards)
-- [ ] Phase 8 — Distributed inference *(next)*
-- [ ] Phase 9 — Failure handling + observability
+- [x] Phase 9 — Failure handling + observability (worker: health/ready/stats/metrics, failure isolation, drain)
+- [ ] Phase 8 — Distributed inference (pipeline parallelism) *(next)*
 - [ ] Phase 10 — GPU-accelerated execution (batched prefill on MPS/CUDA)
 
 ## Setup
@@ -116,6 +122,7 @@ src/vkllm/
   paged_cache.py   # block pool + block tables + paged KV storage (PagedAttention)
   scheduler.py     # continuous-batching + cache-aware scheduler + Request state
   tensor_parallel.py # sharded MLP/attention + all-reduce (tensor parallelism)
+  metrics.py       # throughput / latency percentiles / counters (observability)
   server.py      # FastAPI serving layer
   logger.py      # centralized logging
 tests/           # pytest suite (component + end-to-end correctness)

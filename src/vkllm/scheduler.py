@@ -9,9 +9,12 @@ You (the human) fill in the TODOs. The math lives in model.py and stays untouche
 
 from __future__ import annotations
 
+import time
+
 import torch
 
 from vkllm.logger import get_logger
+from vkllm.metrics import Metrics
 
 log = get_logger(__name__)
 
@@ -38,6 +41,9 @@ class Request:
         self.next_token: torch.Tensor | None = None  # the most recent token to feed next
         self.blocks_held = 0                  # KV-cache blocks reserved for this request
         self.preempted = False                # was this request evicted & is resuming?
+        self.arrived_at = time.time()         # for latency measurement
+        self.failed = False                   # set if this request errored out
+        self.error: str | None = None         # error message, if failed
 
     def reset_for_resume(self, model) -> None:
         """Preemption: drop the KV cache (free its memory) but KEEP the tokens
@@ -94,6 +100,7 @@ class Scheduler:
         self.waiting: list[Request] = []      # arrived but not yet admitted
         self.active: list[Request] = []       # currently being decoded
         self.finished: list[Request] = []     # done, results ready to return
+        self.metrics = Metrics()              # observability
 
     def blocks_needed(self, num_tokens: int) -> int:
         """How many fixed-size blocks hold num_tokens (rounded UP)."""
@@ -103,8 +110,26 @@ class Scheduler:
     def add_request(self, req: Request) -> None:
         # A new request arrives -> put it in the waiting queue.
         self.waiting.append(req)
+        self.metrics.record_arrival()
         log.info("request %s arrived (prompt_len=%d, max_new=%d) | waiting=%d",
                  req.id, len(req.prompt_ids), req.max_new_tokens, len(self.waiting))
+
+    def stats(self) -> dict:
+        """Capacity snapshot for an orchestrator to route by load."""
+        used = self.total_blocks - self.free_blocks
+        return {
+            "active": len(self.active),
+            "waiting": len(self.waiting),
+            "max_active": self.max_active,
+            "blocks_total": self.total_blocks,
+            "blocks_free": self.free_blocks,
+            "kv_utilization": round(max(0, used) / self.total_blocks, 3),
+        }
+
+    def is_overloaded(self) -> bool:
+        """Readiness signal: are we too full to safely take new traffic?"""
+        # overloaded if the active slots are full OR KV cache is nearly exhausted
+        return (len(self.active) >= self.max_active) or (self.free_blocks <= 0)
 
     def _admit(self) -> None:
         """Admit waiting requests -- only if there's room in BOTH the active-slot
@@ -167,54 +192,81 @@ class Scheduler:
         just_prefilled = []
         for req in self.active:
             if not req.prefilled:
-                if req.preempted:
-                    # RESUME: rebuild the K/V cache for all tokens EXCEPT the
-                    # last one, so state matches a request that was never evicted:
-                    # cache holds all-but-last, and next_token (the last token)
-                    # is decoded normally on the following step. We don't record
-                    # a new token here -- we already generated these.
-                    self.model.forward(req.all_ids[:-1], cache=req.cache, position_offset=0)
-                    req.prefilled = True
-                    req.preempted = False
-                    req.next_token = req.all_ids[-1:].clone()  # last token, fed next
-                else:
-                    # FRESH prefill: run the prompt, produce the first token.
-                    logits = self.model.forward(req.prompt_ids, cache=req.cache, position_offset=0)
-                    req.prefilled = True
-                    req.record_token(int(logits[-1].argmax()))
-                    just_prefilled.append(req)
-                self._reserve_if_grown(req)
+                # Isolate failures: a bad request marks ITSELF failed and gets
+                # retired -- it must NOT crash the engine loop (other requests
+                # in the batch keep running). This is worker robustness.
+                try:
+                    if req.preempted:
+                        # RESUME: rebuild K/V for all tokens EXCEPT the last, so
+                        # state matches a never-evicted request; the last token
+                        # is decoded normally next. We don't record a new token.
+                        self.model.forward(req.all_ids[:-1], cache=req.cache, position_offset=0)
+                        req.prefilled = True
+                        req.preempted = False
+                        req.next_token = req.all_ids[-1:].clone()
+                    else:
+                        # FRESH prefill: run the prompt, produce the first token.
+                        logits = self.model.forward(req.prompt_ids, cache=req.cache, position_offset=0)
+                        req.prefilled = True
+                        req.record_token(int(logits[-1].argmax()))
+                        just_prefilled.append(req)
+                    self._reserve_if_grown(req)
+                except Exception as e:
+                    self._fail(req, f"prefill error: {e}")
         if just_prefilled:
             log.debug("prefilled %d request(s): %s",
                       len(just_prefilled), [r.id for r in just_prefilled])
 
-        # 2b. BATCHED DECODE for requests prefilled on a PREVIOUS tick, not done.
+        # 2b. BATCHED DECODE for requests prefilled on a PREVIOUS tick, not done
+        #     and not failed.
         decoding = [r for r in self.active
-                    if r.prefilled and not r.is_done() and r not in just_prefilled]
+                    if r.prefilled and not r.is_done() and not r.failed
+                    and r not in just_prefilled]
         if decoding:
-            token_ids = [int(r.next_token) for r in decoding]
-            caches = [r.cache for r in decoding]
-            offsets = [r.position_offset() for r in decoding]
-            next_ids = self.model.decode_batch(token_ids, caches, offsets)   # (B,)
-            for r, tid in zip(decoding, next_ids):
-                r.record_token(int(tid))
-                self._reserve_if_grown(r)        # each new token may need a block
-            log.debug("decoded batch of %d | max_offset=%d",
-                      len(decoding), max(offsets))
+            try:
+                token_ids = [int(r.next_token) for r in decoding]
+                caches = [r.cache for r in decoding]
+                offsets = [r.position_offset() for r in decoding]
+                next_ids = self.model.decode_batch(token_ids, caches, offsets)   # (B,)
+                for r, tid in zip(decoding, next_ids):
+                    r.record_token(int(tid))
+                    self._reserve_if_grown(r)    # each new token may need a block
+                log.debug("decoded batch of %d | max_offset=%d",
+                          len(decoding), max(offsets))
+            except Exception as e:
+                # Batched decode failed -> isolate: mark the batch failed rather
+                # than crash the engine. (A finer version would bisect the batch
+                # to find the offending request.)
+                for r in decoding:
+                    self._fail(r, f"decode error: {e}")
 
-        # 3. retire finished (rebuild list; don't mutate while iterating).
-        #    A finished request RETURNS all its blocks to the budget for reuse.
+        # 3. retire finished OR failed (rebuild list; don't mutate while iterating).
+        #    A retired request RETURNS all its blocks to the budget for reuse.
         still_active = []
         for req in self.active:
-            if req.is_done():
+            if req.failed:
                 self.free_blocks += req.blocks_held
                 req.blocks_held = 0
+                self.metrics.record_failure()
+                self.finished.append(req)     # finished-with-error; server returns it
+                log.info("request %s FAILED (%s) | freed blocks | free=%d",
+                         req.id, req.error, self.free_blocks)
+            elif req.is_done():
+                self.free_blocks += req.blocks_held
+                req.blocks_held = 0
+                self.metrics.record_completion(time.time() - req.arrived_at, len(req.generated))
                 self.finished.append(req)
                 log.info("request %s finished (%d tokens) | freed blocks | free=%d active=%d",
                          req.id, len(req.generated), self.free_blocks, len(still_active))
             else:
                 still_active.append(req)
         self.active = still_active
+
+    def _fail(self, req: Request, msg: str) -> None:
+        """Mark a request failed so it's retired next -- without crashing."""
+        req.failed = True
+        req.error = msg
+        log.warning("request %s error: %s", req.id, msg)
 
     def _reserve_if_grown(self, req: Request) -> None:
         """After a request adds a token, reserve one more block if it just
