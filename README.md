@@ -104,6 +104,21 @@ curl -X POST http://127.0.0.1:8000/generate \
 
 Set `VKLLM_LOG_LEVEL=DEBUG` to see per-step batch composition.
 
+## Run as a container (Podman / Docker)
+
+The worker is a deployable unit. Build and run:
+
+```bash
+podman build --format docker -t vkllm:latest .
+podman run -d --name vkllm -p 8000:8000 vkllm:latest
+```
+
+The image is CPU-only (containers can't reach the Mac's MPS GPU). Model weights
+download from HuggingFace on first startup; mount a volume at `/app/.hf_cache`
+to persist them across restarts. The container reports a `HEALTHCHECK` on
+`/health` (`podman ps` shows `(healthy)`), which an orchestrator uses for
+liveness. Docker works the same with `docker` in place of `podman`.
+
 ## Tests
 
 The whole engine is verified against HuggingFace and against the naive
